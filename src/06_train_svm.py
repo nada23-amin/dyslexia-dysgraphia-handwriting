@@ -2,6 +2,11 @@
 # from the original research pipeline. Scientific model settings are kept
 # unchanged unless explicitly documented in README.md.
 
+# Standalone evaluation script: trains this classifier independently on the
+# saved CNN features for individual-model comparison. The stacking workflow
+# (src/10_stacking.py) intentionally refits its own fold-specific base models
+# to generate out-of-fold meta-features; it does not load this model artifact.
+
 from config import *
 
 # =======================
@@ -310,3 +315,6 @@ print(
     f"Results saved to:\n"
     f"{results_path}"
 )
+
+# Record exact ordered held-out samples used for these saved predictions.
+write_test_sample_manifest(results_path, y_test)

@@ -25,9 +25,15 @@ import os
 import random
 import hashlib
 import warnings
+import json
+import joblib
+from pathlib import Path
 
 import numpy as np
 import cv2
+# The manuscript experiments were conducted CPU-only. Set before importing TensorFlow.
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
 import tensorflow as tf
 
 from sklearn.model_selection import train_test_split, StratifiedKFold
@@ -38,11 +44,13 @@ from sklearn.metrics import (
     f1_score,
     roc_auc_score,
     log_loss,
-    confusion_matrix
+    confusion_matrix,
+    classification_report
 )
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from statsmodels.stats.contingency_tables import mcnemar
 
 from tensorflow.keras import layers, models
 from tensorflow.keras.models import Sequential
@@ -59,6 +67,10 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 
 SEED = 42
+ABLATION_MODE = os.environ.get("ABLATION_MODE", "standard").strip().lower()
+OUTPUT_ROOT = (Path(__file__).resolve().parents[1] / "outputs"
+               if ABLATION_MODE == "standard"
+               else Path(__file__).resolve().parents[1] / "outputs" / "ablation" / ABLATION_MODE)
 
 os.environ["PYTHONHASHSEED"] = str(SEED)
 
@@ -158,7 +170,8 @@ def compute_image_hash(image_path):
 
 print("\nRemoving duplicate images using SHA-256...")
 
-seen_hashes = set()
+seen_hashes = {}
+duplicate_audit_rows = []
 
 unique_paths = []
 unique_labels = []
@@ -170,9 +183,18 @@ for path, label in zip(all_paths, all_labels):
 
     if image_hash in seen_hashes:
         duplicates += 1
+        canonical_path, canonical_label = seen_hashes[image_hash]
+        duplicate_audit_rows.append({
+            "duplicate_path": str(path),
+            "canonical_path": str(canonical_path),
+            "duplicate_class": CLASS_NAMES[int(label)],
+            "canonical_class": CLASS_NAMES[int(canonical_label)],
+            "sha256": image_hash,
+            "cross_class_duplicate": bool(label != canonical_label),
+        })
         continue
 
-    seen_hashes.add(image_hash)
+    seen_hashes[image_hash] = (path, label)
     unique_paths.append(path)
     unique_labels.append(label)
 
@@ -181,6 +203,18 @@ unique_labels = np.array(unique_labels)
 
 print("Duplicates removed:", duplicates)
 print("Unique images:", len(unique_paths))
+
+# Persist the exact duplicate audit rather than silently discarding duplicate paths.
+import csv
+_audit_dir = OUTPUT_ROOT / "audit" / "dysgraphia"
+_audit_dir.mkdir(parents=True, exist_ok=True)
+with open(_audit_dir / "duplicate_audit.csv", "w", newline="", encoding="utf-8") as _f:
+    _fields = ["duplicate_path", "canonical_path", "duplicate_class", "canonical_class", "sha256", "cross_class_duplicate"]
+    _writer = csv.DictWriter(_f, fieldnames=_fields)
+    _writer.writeheader()
+    _writer.writerows(duplicate_audit_rows)
+if any(row["cross_class_duplicate"] for row in duplicate_audit_rows):
+    raise ValueError("Exact duplicate files were found across different class labels. Resolve label conflicts before training; see outputs/audit/dysgraphia/duplicate_audit.csv.")
 
 for label, class_name in enumerate(CLASS_NAMES):
     print(
@@ -199,7 +233,8 @@ train_paths, temp_paths, train_labels, temp_labels = train_test_split(
     unique_labels,
     test_size=0.30,
     random_state=SEED,
-    shuffle=True
+    shuffle=True,
+    stratify=unique_labels
 )
 
 val_paths, test_paths, val_labels, test_labels = train_test_split(
@@ -207,7 +242,8 @@ val_paths, test_paths, val_labels, test_labels = train_test_split(
     temp_labels,
     test_size=0.50,
     random_state=SEED,
-    shuffle=True
+    shuffle=True,
+    stratify=temp_labels
 )
 
 # IMPORTANT: labels used by CNN/evaluation
@@ -306,6 +342,11 @@ def preprocess_array(image):
             image,
             cv2.COLOR_BGR2GRAY
         )
+
+    # Ablation variant: omit enhancement, denoising, thresholding, and deskewing.
+    # Grayscale conversion and resizing remain common to all variants.
+    if ABLATION_MODE == "no_preprocessing":
+        return cv2.resize(image, (128, 128), interpolation=cv2.INTER_AREA)
 
     clahe = cv2.createCLAHE(
         clipLimit=3.0,
@@ -412,6 +453,9 @@ def augment_training_image(image):
         255
     ).astype(np.uint8)
 
+    if ABLATION_MODE == "no_preprocessing":
+        return np.clip(noisy, 0, 255).astype(np.uint8)
+
     clahe = cv2.createCLAHE(
         clipLimit=3.0,
         tileGridSize=(8, 8)
@@ -469,96 +513,55 @@ test_images = np.array(
     dtype=np.uint8
 )
 
-# Build balanced training set.
+# Build training set. In the no_resampling ablation, use only the original
+# training images without class balancing or augmentation. Otherwise preserve the
+# manuscript's target of 2,000 training images per class.
 balanced_train_images = []
 balanced_train_labels = []
+balanced_train_source_ids = []
+use_resampling = ABLATION_MODE != "no_resampling"
 
-print("\nBuilding balanced training set...")
-
+print("\\nBuilding training set...")
 for label, class_name in enumerate(CLASS_NAMES):
+    class_indices = np.where(train_labels == label)[0]
+    class_images = train_images_original[class_indices]
+    print(f"\\n{class_name}: original train samples = {len(class_images)}")
 
-    class_indices = np.where(
-        train_labels == label
-    )[0]
+    if not use_resampling:
+        selected = list(class_images)
+        balanced_train_images.extend(selected)
+        balanced_train_labels.extend([label] * len(selected))
+        balanced_train_source_ids.extend(class_indices.tolist())
+        print(f"{class_name}: no resampling; retained {len(selected)} original training images")
+        continue
 
-    class_images = train_images_original[
-        class_indices
-    ]
-
-    print(
-        f"\n{class_name}: "
-        f"original train samples = {len(class_images)}"
-    )
-
-    # Keep every original training image.
     selected = list(class_images)
-
-    # Add augmented samples until target is reached.
+    selected_source_ids = class_indices.tolist()
     while len(selected) < TARGET_TRAIN_PER_CLASS:
-
-        source = class_images[
-            random.randrange(len(class_images))
-        ]
-
-        augmented = augment_training_image(
-            source
-        )
-
-        selected.append(
-            augmented
-        )
-
-    selected = selected[
-        :TARGET_TRAIN_PER_CLASS
-    ]
-
+        source_idx = random.randrange(len(class_images))
+        source = class_images[source_idx]
+        selected.append(augment_training_image(source))
+        selected_source_ids.append(int(class_indices[source_idx]))
+    selected = selected[:TARGET_TRAIN_PER_CLASS]
+    selected_source_ids = selected_source_ids[:TARGET_TRAIN_PER_CLASS]
     balanced_train_images.extend(selected)
+    balanced_train_labels.extend([label] * len(selected))
+    balanced_train_source_ids.extend(selected_source_ids)
+    print(f"{class_name}: resampled train samples = {len(selected)}")
 
-    balanced_train_labels.extend(
-        [label] * TARGET_TRAIN_PER_CLASS
-    )
+X_train_img = np.array(balanced_train_images, dtype=np.uint8)
+y_train = np.array(balanced_train_labels, dtype=np.int32)
 
-    print(
-        f"{class_name}: "
-        f"resampled train samples = "
-        f"{TARGET_TRAIN_PER_CLASS}"
-    )
+train_source_ids = np.asarray(balanced_train_source_ids, dtype=np.int64)
+shuffle_indices = np.random.permutation(len(X_train_img))
+X_train_img = X_train_img[shuffle_indices]
+y_train = y_train[shuffle_indices]
+train_source_ids = train_source_ids[shuffle_indices]
 
-X_train_img = np.array(
-    balanced_train_images,
-    dtype=np.uint8
-)
-
-y_train = np.array(
-    balanced_train_labels,
-    dtype=np.int32
-)
-
-# Shuffle the balanced training set.
-shuffle_indices = np.random.permutation(
-    len(X_train_img)
-)
-
-X_train_img = X_train_img[
-    shuffle_indices
-]
-
-y_train = y_train[
-    shuffle_indices
-]
-
-print(
-    "\nFinal balanced training shape:",
-    X_train_img.shape
-)
-
-print(
-    "Final training distribution:",
-    {
-        int(label): int(np.sum(y_train == label))
-        for label in np.unique(y_train)
-    }
-)
+print("\\nFinal training shape:", X_train_img.shape)
+print("Final training distribution:", {
+    int(label): int(np.sum(y_train == label)) for label in np.unique(y_train)
+})
 
 # ==============================================================================
 # 9. CNN INPUT: 28 x 28
@@ -599,6 +602,45 @@ X_test_cnn = prepare_cnn_input(
     test_images
 )
 
+# Persist exact split tensors/labels for independent baseline training and post-hoc visualizations.
+_SPLIT_ARTIFACT_DIR = OUTPUT_ROOT / "splits" / "dysgraphia"
+_SPLIT_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+for _name, _array in {
+    "X_train_cnn.npy": X_train_cnn, "y_train.npy": y_train,
+    "train_source_group_ids.npy": train_source_ids,
+    "X_val_cnn.npy": X_val_cnn, "y_val.npy": y_val,
+    "X_test_cnn.npy": X_test_cnn, "y_test.npy": y_test,
+    "X_test_preprocessed_128.npy": test_images,
+}.items():
+    np.save(_SPLIT_ARTIFACT_DIR / _name, _array)
+# Keep the exact held-out image order alongside y_test for auditing paired predictions.
+with open(_SPLIT_ARTIFACT_DIR / "test_sample_paths.json", "w", encoding="utf-8") as _f:
+    json.dump([str(Path(p).resolve()) for p in test_paths], _f, indent=2)
+_split_manifest = {
+    "task": "dysgraphia", "split_protocol": "image-level 70/15/15", "seed": SEED,
+    "class_names": CLASS_NAMES, "n_unique_original_images": int(len(unique_paths)),
+    "n_original_train_before_augmentation": int(len(train_paths)),
+    "n_train_after_augmentation": int(len(y_train)),
+    "n_validation": int(len(y_val)), "n_test": int(len(y_test)),
+    "original_class_counts": {CLASS_NAMES[i]: int(np.sum(unique_labels == i)) for i in range(len(CLASS_NAMES))},
+    "manuscript_expected_counts": {"original_total": 249, "original_train": 174, "validation": 37, "test": 38, "train_after_augmentation": 4000},
+    "n_test_by_class": {CLASS_NAMES[i]: int(np.sum(y_test == i)) for i in range(len(CLASS_NAMES))},
+    "participant_grouping": "not possible; participant IDs unavailable",
+    "augmentation_applied_to": "training subset only",
+}
+_split_manifest["matches_manuscript_expected_counts"] = all([
+    _split_manifest["n_unique_original_images"] == 249,
+    _split_manifest["n_original_train_before_augmentation"] == 174,
+    _split_manifest["n_validation"] == 37,
+    _split_manifest["n_test"] == 38,
+    _split_manifest["n_train_after_augmentation"] == 4000,
+    _split_manifest["original_class_counts"] == {"Low Potential Dysgraphia": 135, "Potential Dysgraphia": 114},
+])
+with open(_SPLIT_ARTIFACT_DIR / "split_manifest.json", "w", encoding="utf-8") as _f:
+    json.dump(_split_manifest, _f, indent=2)
+if not _split_manifest["matches_manuscript_expected_counts"]:
+    print("WARNING: dysgraphia source/split counts differ from manuscript-reported counts. Verify dataset version and duplicate audit before submission.")
+
 print("\nCNN data shapes:")
 print("X_train:", X_train_cnn.shape)
 print("X_val  :", X_val_cnn.shape)
@@ -617,10 +659,7 @@ from tensorflow.keras.layers import (
     Dense,
     Dropout
 )
-from tensorflow.keras.callbacks import (
-    EarlyStopping,
-    ReduceLROnPlateau
-)
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
 tf.keras.backend.clear_session()
 
@@ -680,37 +719,24 @@ cnn.summary()
 # 11. CNN TRAINING
 # ==============================================================================
 
-callbacks = [
-    EarlyStopping(
-        monitor="val_loss",
-        patience=5,
-        restore_best_weights=True,
-        verbose=1
-    ),
-
-    ReduceLROnPlateau(
-        monitor="val_loss",
-        factor=0.5,
-        patience=2,
-        min_lr=1e-6,
-        verbose=1
-    )
-]
-
-print("\nTraining CNN...")
-
+# The manuscript specifies 20 epochs with validation monitoring. The learning-rate
+# scheduler monitors validation loss but does not stop training early.
+print("\nTraining CNN for 20 epochs with validation monitoring...")
 history = cnn.fit(
     X_train_cnn,
     y_train,
-    validation_data=(
-        X_val_cnn,
-        y_val
-    ),
+    validation_data=(X_val_cnn, y_val),
     epochs=20,
     batch_size=64,
-    callbacks=callbacks,
+    callbacks=[ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6)],
     verbose=1
 )
+
+
+# Save the CNN whose 128-D penultimate-layer features are used downstream.
+_MODEL_DIR = OUTPUT_ROOT / "models"
+_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+cnn.save(_MODEL_DIR / "dysgraphia_feature_extractor_cnn.keras")
 
 # ==============================================================================
 # 12. CNN EVALUATION
@@ -749,6 +775,12 @@ def evaluate_binary(
         average="weighted",
         zero_division=0
     )
+
+    # The manuscript's stacking table reports macro-averaged precision, recall, and F1.
+    # Keep weighted metrics too for the base-classifier comparison table.
+    result["Macro Precision"] = precision_score(y_true, y_pred, average="macro", zero_division=0)
+    result["Macro Recall"] = recall_score(y_true, y_pred, average="macro", zero_division=0)
+    result["Macro F1"] = f1_score(y_true, y_pred, average="macro", zero_division=0)
 
     result["ROC-AUC"] = roc_auc_score(
         y_true,
@@ -968,6 +1000,7 @@ standalone_mlp_history = standalone_mlp.fit(
     epochs=50,
     batch_size=64,
     shuffle=True,
+    callbacks=[EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)],
     verbose=1
 )
 
@@ -1012,11 +1045,13 @@ skf = StratifiedKFold(
     random_state=SEED
 )
 
+# Manuscript protocol: retain both class probabilities from each binary base
+# classifier (5 classifiers x 2 class probabilities = 10 meta-features).
+N_CLASSES = 2
+N_META_FEATURES = len(MODEL_NAMES) * N_CLASSES
+
 oof_meta = np.zeros(
-    (
-        len(X_train_features),
-        len(MODEL_NAMES)
-    ),
+    (len(X_train_features), N_META_FEATURES),
     dtype=np.float32
 )
 
@@ -1031,14 +1066,21 @@ test_fold_predictions = {
 }
 
 for fold, (train_idx, valid_idx) in enumerate(
-    skf.split(
-        X_train_features,
-        y_train
+    StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED).split(
+        X_train_cnn, y_train
     ),
     start=1
 ):
 
     print(f"\nFold {fold}/5")
+
+    # Manuscript-aligned protocol: CNN embeddings are extracted once by the
+    # feature-extraction stage and treated as fixed features for downstream
+    # classifiers. The five-fold split applies to base-classifier fitting.
+    X_fold_train = X_train_features[train_idx]
+    X_fold_valid = X_train_features[valid_idx]
+    X_val_fold = X_val_features
+    X_test_fold = X_test_features
 
     for model_idx, name in enumerate(
         MODEL_NAMES
@@ -1049,87 +1091,47 @@ for fold, (train_idx, valid_idx) in enumerate(
         if name == "MLP":
 
             model = build_mlp(
-                X_train_features.shape[1]
+                X_fold_train.shape[1]
             )
 
+            # Match the manuscript's stacking protocol: fixed 50 epochs,
+            # batch size 64, and no EarlyStopping within the OOF fold.
+            # The held-out fold is used only to generate OOF predictions.
             model.fit(
-                X_train_features[train_idx],
+                X_fold_train,
                 y_train[train_idx],
-                validation_data=(
-                    X_train_features[valid_idx],
-                    y_train[valid_idx]
-                ),
                 epochs=50,
                 batch_size=64,
                 verbose=0
             )
 
             oof_prob = model.predict(
-                X_train_features[valid_idx],
-                verbose=0
-            )[:, 1]
-
-            val_prob = model.predict(
-                X_val_features,
-                verbose=0
-            )[:, 1]
-
-            test_prob = model.predict(
-                X_test_features,
-                verbose=0
-            )[:, 1]
+                X_fold_valid, verbose=0
+            )
+            val_prob = model.predict(X_val_fold, verbose=0)
+            test_prob = model.predict(X_test_fold, verbose=0)
 
         else:
-
             model = make_model(name)
+            model.fit(X_fold_train, y_train[train_idx])
+            oof_prob = model.predict_proba(X_fold_valid)
+            val_prob = model.predict_proba(X_val_fold)
+            test_prob = model.predict_proba(X_test_fold)
 
-            model.fit(
-                X_train_features[train_idx],
-                y_train[train_idx]
-            )
+        # Store the complete two-class probability vector for this model.
+        start = model_idx * N_CLASSES
+        stop = start + N_CLASSES
+        oof_meta[valid_idx, start:stop] = oof_prob
+        val_fold_predictions[name].append(val_prob)
+        test_fold_predictions[name].append(test_prob)
 
-            oof_prob = model.predict_proba(
-                X_train_features[valid_idx]
-            )[:, 1]
-
-            val_prob = model.predict_proba(
-                X_val_features
-            )[:, 1]
-
-            test_prob = model.predict_proba(
-                X_test_features
-            )[:, 1]
-
-        # OOF prediction for the held-out training fold.
-        oof_meta[
-            valid_idx,
-            model_idx
-        ] = oof_prob
-
-        # Validation prediction from this fold.
-        val_fold_predictions[name].append(
-            val_prob
-        )
-
-        # Independent test prediction from this fold.
-        test_fold_predictions[name].append(
-            test_prob
-        )
-
-# Average fold predictions for validation and test.
+# Average each class probability over the five fold-specific models.
 val_meta = np.column_stack([
-    np.mean(
-        val_fold_predictions[name],
-        axis=0
-    )
+    np.mean(val_fold_predictions[name], axis=0)
     for name in MODEL_NAMES
 ])
-
 test_meta = np.column_stack([
-    np.mean(
-        test_fold_predictions[name],
-        axis=0
-    )
+    np.mean(test_fold_predictions[name], axis=0)
     for name in MODEL_NAMES
 ])
 
@@ -1227,20 +1229,11 @@ base_test_results = {}
 
 for model_idx, name in enumerate(MODEL_NAMES):
 
-    probabilities = test_meta[:, model_idx]
+    start = model_idx * N_CLASSES
+    probabilities = test_meta[:, start:start + N_CLASSES]
+    predictions = np.argmax(probabilities, axis=1)
 
-    predictions = (
-        probabilities >= 0.5
-    ).astype(int)
-
-    result = evaluate_binary(
-        y_test,
-        predictions,
-        np.column_stack([
-            1 - probabilities,
-            probabilities
-        ])
-    )
+    result = evaluate_binary(y_test, predictions, probabilities)
 
     base_test_results[name] = result
 
@@ -1254,7 +1247,101 @@ for model_idx, name in enumerate(MODEL_NAMES):
         )
 
 # ==============================================================================
-# 19. FINAL SUMMARY
+# 19. SAVE TEST PREDICTIONS, PROBABILITIES, METRICS, AND PAIRED TESTS
+# ==============================================================================
+
+RESULT_DIR = OUTPUT_ROOT / "results" / "dysgraphia"
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Save labels and meta-features so every reported metric can be recomputed later.
+np.save(RESULT_DIR / "y_test_true.npy", y_test)
+np.save(RESULT_DIR / "test_meta_features.npy", test_meta)
+np.save(RESULT_DIR / "oof_meta_features.npy", oof_meta)
+np.save(RESULT_DIR / "y_test_pred_stacking.npy", test_stack_pred)
+np.save(RESULT_DIR / "y_test_proba_stacking.npy", np.column_stack([1-test_stack_prob, test_stack_prob]))
+joblib.dump(meta_learner, RESULT_DIR / "stacking_meta_learner.joblib")
+
+# Record the exact ordered held-out source images and labels used by every
+# prediction written below. All models in this script use the same test arrays.
+_ordered_test_paths = [str(Path(p).resolve()) for p in test_paths]
+_ordered_paths_bytes = json.dumps(
+    _ordered_test_paths, ensure_ascii=False, separators=(",", ":")
+).encode("utf-8")
+_test_labels_bytes = np.asarray(y_test, dtype=np.int64).tobytes()
+_dysgraphia_test_manifest = {
+    "task": "dysgraphia",
+    "n_test": int(len(y_test)),
+    "ordered_test_paths": _ordered_test_paths,
+    "ordered_paths_sha256": hashlib.sha256(_ordered_paths_bytes).hexdigest(),
+    "test_labels_sha256": hashlib.sha256(_test_labels_bytes).hexdigest(),
+    "label_source": "y_test from current dysgraphia_pipeline.py run",
+    "prediction_source": "all model predictions generated in this pipeline run",
+}
+(RESULT_DIR / "test_sample_manifest.json").write_text(
+    json.dumps(_dysgraphia_test_manifest, indent=2), encoding="utf-8"
+)
+
+all_test_predictions = {"Stacking": test_stack_pred}
+all_metrics = {"Stacking": stack_test_metrics}
+for model_idx, name in enumerate(MODEL_NAMES):
+    start = model_idx * N_CLASSES
+    prob = test_meta[:, start:start + N_CLASSES]
+    pred = np.argmax(prob, axis=1)
+    all_test_predictions[name] = pred
+    np.save(RESULT_DIR / f"y_test_pred_{name.lower().replace(' ', '_')}.npy", pred)
+    np.save(RESULT_DIR / f"y_test_proba_{name.lower().replace(' ', '_')}.npy", prob)
+    all_metrics[name] = base_test_results[name]
+
+cm = confusion_matrix(y_test, test_stack_pred, labels=[0, 1])
+np.savetxt(RESULT_DIR / "confusion_matrix_stacking.csv", cm, delimiter=",", fmt="%d")
+with open(RESULT_DIR / "classification_report_stacking.json", "w", encoding="utf-8") as f:
+    json.dump(classification_report(y_test, test_stack_pred, labels=[0, 1],
+                                   target_names=CLASS_NAMES, output_dict=True,
+                                   zero_division=0), f, indent=2)
+with open(RESULT_DIR / "test_metrics.json", "w", encoding="utf-8") as f:
+    json.dump({k: {m: float(v) for m, v in val.items()} for k, val in all_metrics.items()}, f, indent=2)
+
+# Exact two-sided McNemar tests on paired predictions from the identical test set.
+# Fail closed if the current-run manifest or saved predictions are inconsistent.
+_manifest_path = RESULT_DIR / "test_sample_manifest.json"
+if not _manifest_path.exists():
+    raise FileNotFoundError("Missing current-run test_sample_manifest.json; cannot verify paired McNemar inputs.")
+_manifest_check = json.loads(_manifest_path.read_text(encoding="utf-8"))
+_expected_label_hash = hashlib.sha256(np.asarray(y_test, dtype=np.int64).tobytes()).hexdigest()
+if (_manifest_check.get("task") != "dysgraphia"
+        or _manifest_check.get("n_test") != len(y_test)
+        or _manifest_check.get("test_labels_sha256") != _expected_label_hash
+        or len(_manifest_check.get("ordered_test_paths", [])) != len(y_test)):
+    raise ValueError("Dysgraphia test manifest does not match this run; refusing McNemar.")
+for _model_name, _model_pred in all_test_predictions.items():
+    if len(_model_pred) != len(y_test):
+        raise ValueError(f"McNemar refused: {_model_name} predictions do not match test labels length.")
+    if np.any((_model_pred < 0) | (_model_pred > 1)):
+        raise ValueError(f"McNemar refused: invalid class encoding in {_model_name} predictions.")
+mcnemar_results = {}
+for name, pred in all_test_predictions.items():
+    if name == "Stacking":
+        continue
+    stack_correct = (test_stack_pred == y_test)
+    model_correct = (pred == y_test)
+    table = np.array([
+        [np.sum(stack_correct & model_correct), np.sum(stack_correct & ~model_correct)],
+        [np.sum(~stack_correct & model_correct), np.sum(~stack_correct & ~model_correct)]
+    ], dtype=int)
+    test_result = mcnemar(table, exact=True)
+    mcnemar_results[f"Stacking_vs_{name}"] = {
+        "contingency_table": table.tolist(),
+        "statistic": float(test_result.statistic),
+        "p_value": float(test_result.pvalue),
+        "n_test": int(len(y_test))
+    }
+with open(RESULT_DIR / "mcnemar_exact_paired.json", "w", encoding="utf-8") as f:
+    json.dump(mcnemar_results, f, indent=2)
+
+print(f"\nSaved final Dysgraphia test predictions and analyses to: {RESULT_DIR}")
+
+# ==============================================================================
+# 20. FINAL SUMMARY
 # ==============================================================================
 
 print("\n" + "=" * 80)

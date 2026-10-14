@@ -6,6 +6,10 @@ from config import *
 import os
 import shutil
 import cv2
+import logging
+import random
+import concurrent.futures
+from tqdm import tqdm
 
 # ============================================================
 # LOGGING
@@ -29,6 +33,26 @@ balanced_train_path = str(BALANCED_DIR)
 # ============================================================
 
 categories = CLASSES
+
+# Ablation variant: omit training-set resampling/augmentation entirely.
+# Copy the original training split into the expected loader directory so all
+# downstream stages keep the same interfaces and the validation/test sets stay fixed.
+if os.environ.get("ABLATION_MODE", "standard").strip().lower() == "no_resampling":
+    import shutil
+    from pathlib import Path
+    if os.path.exists(balanced_train_path):
+        shutil.rmtree(balanced_train_path)
+    os.makedirs(balanced_train_path, exist_ok=True)
+    for category in categories:
+        src = os.path.join(split_path, "train", category)
+        dst = os.path.join(balanced_train_path, category)
+        os.makedirs(dst, exist_ok=True)
+        if os.path.isdir(src):
+            for filename in os.listdir(src):
+                if filename.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".bmp")):
+                    shutil.copy2(os.path.join(src, filename), os.path.join(dst, filename))
+    print("ABLATION_MODE=no_resampling: copied original training split without balancing or augmentation.")
+    raise SystemExit(0)
 
 # ============================================================
 # REPRODUCIBILITY
@@ -152,6 +176,11 @@ def augment_image(image):
             0,
             255
         ).astype(np.uint8)
+
+        # In the no-preprocessing ablation, keep geometric/noise augmentation
+        # but omit contrast enhancement and adaptive thresholding.
+        if os.environ.get("ABLATION_MODE", "standard").strip().lower() == "no_preprocessing":
+            return noisy
 
         # ----------------------------------------------------
         # 3. CLAHE

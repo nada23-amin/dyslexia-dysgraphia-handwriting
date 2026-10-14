@@ -20,7 +20,7 @@ total_images = 0
 for class_name in classes:
     class_dir = DATA_DIR / class_name
 
-    images = list(class_dir.glob("*.png"))
+    images = [p for p in class_dir.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}]
 
     count = len(images)
     total_images += count
@@ -72,8 +72,13 @@ def compute_image_hash(image_path):
 
 
 # ============================================================
-# GLOBAL DUPLICATE REMOVAL
+# GLOBAL DUPLICATE AUDIT (NON-DESTRUCTIVE)
 # ============================================================
+
+# Only canonical (first-seen) images are processed. Duplicate source files are
+# reported in a CSV; raw files are never deleted or modified.
+UNIQUE_FILES_BY_CLASS = {category: [] for category in classes}
+DUPLICATE_ROWS = []
 
 def remove_global_duplicates():
 
@@ -114,30 +119,30 @@ def remove_global_duplicates():
                 continue
 
             if image_hash in seen_hashes:
-
-                duplicates.append(
-                    (
-                        image_path,
-                        seen_hashes[image_hash]
-                    )
-                )
-
+                original_path = seen_hashes[image_hash]
+                duplicates.append((image_path, original_path))
+                DUPLICATE_ROWS.append({
+                    "duplicate_path": image_path,
+                    "canonical_path": original_path,
+                    "sha256": image_hash,
+                })
             else:
-
                 seen_hashes[image_hash] = image_path
+                UNIQUE_FILES_BY_CLASS[category].append(filename)
 
-    # Delete duplicate copies
-    for duplicate_path, original_path in duplicates:
+    # Audit log only; never remove or alter raw data.
+    import csv
+    audit_path = Path(output_folder) / "duplicate_audit.csv"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(audit_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["duplicate_path", "canonical_path", "sha256"]
+        )
+        writer.writeheader()
+        writer.writerows(DUPLICATE_ROWS)
 
-        try:
-            os.remove(duplicate_path)
-
-        except Exception as e:
-
-            logging.error(
-                f"Error deleting {duplicate_path}: {e}"
-            )
-
+    logging.info("Duplicate audit written to %s", audit_path)
+    logging.info("Raw source files were not deleted or modified.")
     return len(duplicates)
 
 
@@ -235,6 +240,14 @@ def process_image(
 
             return
 
+        # Ablation: remove the entire enhancement/denoising/thresholding/deskew
+        # stage while retaining grayscale conversion and the common 128x128 input
+        # resizing required by the downstream CNN loader.
+        if os.environ.get("ABLATION_MODE", "standard").strip().lower() == "no_preprocessing":
+            resized = cv2.resize(image, (128, 128), interpolation=cv2.INTER_AREA)
+            cv2.imwrite(output_path, resized)
+            return
+
         # CLAHE
         clahe = cv2.createCLAHE(
             clipLimit=3.0,
@@ -307,12 +320,9 @@ def process_category(
         exist_ok=True
     )
 
-    image_files = [
-        f for f in os.listdir(category_path)
-        if f.lower().endswith(
-            (".jpg", ".png", ".jpeg", ".tif", ".bmp")
-        )
-    ]
+    # Process only the first-seen file for each exact SHA-256 hash. This keeps
+    # duplicate removal before splitting while preserving the raw dataset.
+    image_files = list(UNIQUE_FILES_BY_CLASS.get(category, []))
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=8
@@ -352,9 +362,16 @@ print("=" * 60)
 # 1. Global duplicate removal BEFORE splitting
 remove_global_duplicates()
 
-# 2. Preprocess all classes
+# 2. Clear only generated class folders to prevent stale processed files from
+# previous runs being mixed with the current duplicate-filtered dataset.
 for category in classes:
+    generated_class_dir = Path(output_folder) / category
+    if generated_class_dir.exists():
+        import shutil
+        shutil.rmtree(generated_class_dir)
 
+# 3. Preprocess only canonical files for each class; source data remains untouched.
+for category in classes:
     process_category(category)
 
 print("=" * 60)

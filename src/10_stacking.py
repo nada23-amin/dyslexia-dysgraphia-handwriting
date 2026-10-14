@@ -2,17 +2,31 @@
 # from the original research pipeline. Scientific model settings are kept
 # unchanged unless explicitly documented in README.md.
 
+# IMPORTANT WORKFLOW NOTE:
+# The CNN is trained once by 04_train_cnn_extract_features.py. Five-fold
+# cross-validation is applied to the fixed 128-D embeddings, as described in
+# the manuscript; held-out fold samples are excluded from each base learner.
+# Standalone classifier scripts are for independent comparison and their
+# saved model artifacts are not loaded by this stacking procedure.
+
 from config import *
+import os
+import re
+from pathlib import Path
 
 # ============================================================
 # TensorFlow / Keras
 # ============================================================
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
 import tensorflow as tf
 
+from tensorflow.keras import layers, models
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
 
 # ============================================================
@@ -110,6 +124,41 @@ if len(y_test.shape) > 1 and y_test.shape[1] > 1:
         axis=1
     )
 
+
+# Load ordered raw image paths only to identify augmented variants from the
+# same source image and keep them in the same downstream-classifier CV fold.
+# CNN embeddings are already extracted and loaded above.
+def _load_raw_images(directory):
+    ds = tf.keras.utils.image_dataset_from_directory(
+        str(directory), labels="inferred", label_mode="int",
+        class_names=CLASS_NAMES, color_mode="grayscale",
+        image_size=(28, 28), batch_size=64, shuffle=False
+    )
+    paths = [str(Path(p).resolve()) for p in ds.file_paths]
+    images, labels = [], []
+    for xb, yb in ds:
+        images.append((xb.numpy().astype(np.float32) / 255.0))
+        labels.append(yb.numpy())
+    return np.concatenate(images), np.concatenate(labels), paths
+
+X_train_raw, y_train_raw, train_paths = _load_raw_images(BALANCED_DIR)
+X_val_raw, y_val_raw, val_paths = _load_raw_images(SPLIT_DIR / "val")
+X_test_raw, y_test_raw, test_paths = _load_raw_images(SPLIT_DIR / "test")
+if not np.array_equal(y_train_raw, y_train):
+    raise ValueError("Ordered raw training labels do not match saved feature labels; refusing misaligned OOF stacking.")
+if not np.array_equal(y_val_raw, y_val) or not np.array_equal(y_test_raw, y_test):
+    raise ValueError("Ordered raw validation/test labels do not match saved feature labels.")
+
+def _source_group(path):
+    # 03_balance_train.py names generated images as aug_<counter>_<source-name>.
+    # Keep every augmentation of an original image in the same CV fold.
+    name = Path(path).name
+    match = re.match(r"^aug_\d+_(.+)$", name, flags=re.IGNORECASE)
+    source_name = match.group(1) if match else name
+    parent_class = Path(path).parent.name
+    return f"{parent_class}/{source_name}"
+
+train_groups = np.asarray([_source_group(p) for p in train_paths])
 
 # ============================================================
 # DATA INFORMATION
@@ -250,9 +299,8 @@ for fold, (
     train_idx,
     valid_idx
 ) in enumerate(
-    skf.split(
-        X_train,
-        y_train
+    StratifiedKFold(n_splits=5, shuffle=True, random_state=42).split(
+        X_train_raw, y_train
     ),
     start=1
 ):
@@ -263,21 +311,13 @@ for fold, (
     )
     print("=" * 70)
 
-    X_fold_train = X_train[
-        train_idx
-    ]
-
-    y_fold_train = y_train[
-        train_idx
-    ]
-
-    X_fold_valid = X_train[
-        valid_idx
-    ]
-
-    y_fold_valid = y_train[
-        valid_idx
-    ]
+    # Manuscript-aligned protocol: use the fixed 128-D embeddings produced by
+    # the separately trained CNN. Cross-validation applies to the downstream
+    # base classifiers; the held-out fold is excluded from each classifier fit.
+    X_fold_train = X_train[train_idx]
+    X_fold_valid = X_train[valid_idx]
+    y_fold_train = y_train[train_idx]
+    y_fold_valid = y_train[valid_idx]
 
     print(
         f"Fold training samples   : "
@@ -382,13 +422,11 @@ for fold, (
         metrics=["accuracy"]
     )
 
+    # Use a fixed, pre-specified training duration within each stacking fold.
+    # The outer held-out fold is reserved exclusively for generating OOF predictions.
     mlp.fit(
         X_fold_train,
         y_fold_train,
-        validation_data=(
-            X_fold_valid,
-            y_fold_valid
-        ),
         epochs=50,
         batch_size=64,
         verbose=0
@@ -979,6 +1017,9 @@ np.save(
     ),
     oof_lgbm
 )
+
+# Persist exact ordered test samples for paired statistical comparisons.
+write_test_sample_manifest(result_dir, y_test)
 
 
 # ============================================================

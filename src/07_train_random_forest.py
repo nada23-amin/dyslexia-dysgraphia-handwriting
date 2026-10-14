@@ -2,6 +2,11 @@
 # from the original research pipeline. Scientific model settings are kept
 # unchanged unless explicitly documented in README.md.
 
+# Standalone evaluation script: trains this classifier independently on the
+# saved CNN features for individual-model comparison. The stacking workflow
+# (src/10_stacking.py) intentionally refits its own fold-specific base models
+# to generate out-of-fold meta-features; it does not load this model artifact.
+
 from config import *
 
 # ================================================================
@@ -230,6 +235,9 @@ print("\nRandom Forest model saved successfully.")
 np.save(RF_RESULT_DIR / "rf_test_predictions.npy", y_test_pred)
 
 np.save(RF_RESULT_DIR / "rf_test_probabilities.npy", y_test_prob)
+
+# Record exact ordered held-out samples used for these saved predictions.
+write_test_sample_manifest(RF_RESULT_DIR, y_test)
 
 print("Predictions and probabilities saved successfully.")
 

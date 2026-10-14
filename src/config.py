@@ -5,6 +5,11 @@ import random
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ABLATION_MODE = os.environ.get("ABLATION_MODE", "standard").strip().lower()
+# Each ablation run receives isolated generated outputs so variants cannot overwrite
+# the full-framework outputs or one another.
+OUTPUT_ROOT = (PROJECT_ROOT / "outputs" if ABLATION_MODE == "standard"
+               else PROJECT_ROOT / "outputs" / "ablation" / ABLATION_MODE)
 
 # Users can override the dataset location without editing source code.
 # Example (PowerShell):
@@ -14,13 +19,13 @@ _DATA_ENV = os.environ.get("DYSLEXIA_DATA_DIR")
 RAW_DIR = Path(_DATA_ENV).expanduser().resolve() if _DATA_ENV else PROJECT_ROOT / "data" / "raw"
 DATA_DIR = RAW_DIR
 
-PROCESSED_DIR = PROJECT_ROOT / "outputs" / "processed_data"
-SPLIT_DIR = PROJECT_ROOT / "outputs" / "splits"
-BALANCED_DIR = PROJECT_ROOT / "outputs" / "balanced_train"
-MODEL_DIR = PROJECT_ROOT / "outputs" / "models"
-FEATURE_DIR = PROJECT_ROOT / "outputs" / "features"
-RESULT_DIR = PROJECT_ROOT / "outputs" / "results"
-FIGURE_DIR = PROJECT_ROOT / "outputs" / "figures"
+PROCESSED_DIR = OUTPUT_ROOT / "processed_data"
+SPLIT_DIR = OUTPUT_ROOT / "splits"
+BALANCED_DIR = OUTPUT_ROOT / "balanced_train"
+MODEL_DIR = OUTPUT_ROOT / "models"
+FEATURE_DIR = OUTPUT_ROOT / "features"
+RESULT_DIR = OUTPUT_ROOT / "results"
+FIGURE_DIR = OUTPUT_ROOT / "figures"
 CNN_RESULT_DIR = MODEL_DIR / "cnn"
 MLP_RESULT_DIR = RESULT_DIR / "mlp"
 SVM_RESULT_DIR = RESULT_DIR / "svm"
@@ -53,3 +58,34 @@ def seed_everything(seed: int = SEED) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
+
+
+def write_test_sample_manifest(output_dir, expected_labels):
+    """Write an auditable link between a model's saved test outputs and the exact ordered test split."""
+    import hashlib
+    import json
+    output_dir = Path(output_dir)
+    path_file = FEATURE_DIR / "test_sample_paths.json"
+    labels_file = FEATURE_DIR / "y_test.npy"
+    if not path_file.exists() or not labels_file.exists():
+        raise FileNotFoundError(
+            "Cannot write test manifest: rerun CNN feature extraction to create "
+            "features/test_sample_paths.json and features/y_test.npy first."
+        )
+    paths = json.loads(path_file.read_text(encoding="utf-8"))
+    labels = np.asarray(np.load(labels_file)).reshape(-1)
+    expected = np.asarray(expected_labels).reshape(-1)
+    if len(paths) != len(labels) or len(expected) != len(labels) or not np.array_equal(expected.astype(int), labels.astype(int)):
+        raise ValueError("Test manifest paths/labels do not match the labels used by this model run.")
+    canonical_paths = json.dumps(paths, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    canonical_labels = np.asarray(labels, dtype=np.int64).tobytes()
+    payload = {
+        "task": "dyslexia",
+        "n_test": int(len(labels)),
+        "ordered_test_paths": paths,
+        "ordered_paths_sha256": hashlib.sha256(canonical_paths).hexdigest(),
+        "test_labels_sha256": hashlib.sha256(canonical_labels).hexdigest(),
+        "label_source": str(labels_file),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "test_sample_manifest.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")

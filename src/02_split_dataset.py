@@ -17,9 +17,6 @@ output_folder = SPLIT_DIR
 
 categories = ["Corrected", "Normal", "Reversal"]
 
-
-categories = ["Corrected", "Normal", "Reversal"]
-
 RANDOM_STATE = 42
 
 
@@ -155,3 +152,32 @@ print(f"Test %         : {total_test / total_original * 100:.2f}%")
 print("-" * 70)
 
 print(f"Output folder:\n{output_folder}")
+
+
+# Save an explicit split manifest so reviewers can verify the image-level protocol.
+import json
+manifest = {
+    "task": "dyslexia_related_handwriting_patterns",
+    "protocol": "image-level 70/15/15 split performed separately within each class",
+    "seed": RANDOM_STATE,
+    "class_names": categories,
+    "counts": {},
+    "manuscript_expected_counts": {"train": 125986, "val": 26997, "test": 26997, "total": 179980},
+}
+for split_name in ["train", "val", "test"]:
+    manifest["counts"][split_name] = {
+        category: len([p for p in (output_folder / split_name / category).iterdir() if p.is_file()])
+        for category in categories
+    }
+    manifest["counts"][split_name]["total"] = sum(manifest["counts"][split_name].values())
+manifest["actual_counts"] = {name: int(manifest["counts"][name]["total"]) for name in ["train", "val", "test"]}
+manifest["actual_counts"]["total"] = sum(manifest["actual_counts"].values())
+manifest["matches_manuscript_expected_counts"] = all(
+    manifest["actual_counts"][k] == manifest["manuscript_expected_counts"][k]
+    for k in ["train", "val", "test", "total"]
+)
+manifest_path = Path(output_folder) / "split_manifest.json"
+manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+print(f"Saved split manifest: {manifest_path}")
+if not manifest["matches_manuscript_expected_counts"]:
+    print("WARNING: generated split counts differ from manuscript-reported counts. Verify the dataset version, duplicate removal, and split protocol before submission.")

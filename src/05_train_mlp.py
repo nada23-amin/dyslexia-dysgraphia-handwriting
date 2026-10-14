@@ -2,7 +2,18 @@
 # from the original research pipeline. Scientific model settings are kept
 # unchanged unless explicitly documented in README.md.
 
+# Standalone evaluation script: trains this classifier independently on the
+# saved CNN features for individual-model comparison. The stacking workflow
+# (src/10_stacking.py) intentionally refits its own fold-specific base models
+# to generate out-of-fold meta-features; it does not load this model artifact.
+
 from config import *
+import tensorflow as tf
+from tqdm import tqdm
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.optimizers import Adam
 
 # ============================================================
 # DISABLE GPU
@@ -192,6 +203,7 @@ history = model.fit(
     epochs=50,
     batch_size=64,
     shuffle=True,
+    callbacks=[EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)],
     verbose=1
 )
 
@@ -387,6 +399,9 @@ print("=" * 60)
 print(
     f"Results saved to:\n{results_path}"
 )
+
+# Record exact ordered held-out samples used for these saved predictions.
+write_test_sample_manifest(results_path, y_test)
 from sklearn.svm import SVC
 from sklearn.metrics import (
     accuracy_score,

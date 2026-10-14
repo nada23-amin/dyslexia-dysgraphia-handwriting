@@ -10,11 +10,14 @@ from config import *
 # ================================================================
 
 import os
+# The manuscript experiments were conducted CPU-only. Set before importing TensorFlow.
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
 import numpy as np
 import tensorflow as tf
+from tensorflow.keras.callbacks import ReduceLROnPlateau
 
 from tensorflow.keras import layers, models
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
 
 # ================================================================
@@ -102,6 +105,8 @@ test_ds = tf.keras.utils.image_dataset_from_directory(
     batch_size=BATCH_SIZE,
     shuffle=False
 )
+# Capture paths before map/prefetch transforms the dataset object.
+_test_file_paths = list(test_ds.file_paths)
 
 
 # ================================================================
@@ -257,46 +262,20 @@ model.compile(
 
 
 # ================================================================
-# 10. EARLY STOPPING
+# 10. TRAIN CNN WITH VALIDATION MONITORING
 # ================================================================
-
-early_stopping = EarlyStopping(
-    monitor="val_loss",
-    patience=5,
-    restore_best_weights=True,
-    verbose=1
-)
-
-
-# ================================================================
-# 11. LEARNING RATE REDUCTION
-# ================================================================
-
-reduce_lr = ReduceLROnPlateau(
-    monitor="val_loss",
-    factor=0.5,
-    patience=3,
-    min_lr=1e-6,
-    verbose=1
-)
-
-
-# ================================================================
-# 12. TRAIN CNN
-# ================================================================
+# The manuscript specifies 20 epochs and validation monitoring. ReduceLROnPlateau
+# uses validation loss to reduce the learning rate; it does not stop training early.
 
 print("\n" + "=" * 70)
-print("STARTING CNN TRAINING")
+print("STARTING CNN TRAINING (20 EPOCHS; VALIDATION MONITORING)")
 print("=" * 70)
 
 history = model.fit(
     train_ds,
     validation_data=val_ds,
     epochs=EPOCHS,
-    callbacks=[
-        early_stopping,
-        reduce_lr
-    ],
+    callbacks=[ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6)],
     verbose=1
 )
 
@@ -425,6 +404,20 @@ def extract_features(dataset):
     return features, labels
 
 
+# Build a separate, deterministic extraction dataset. The training dataset is
+# shuffled during fitting, but feature rows must have a stable one-to-one
+# correspondence with file paths and labels for fold-wise OOF CNN training.
+train_feature_ds = tf.keras.utils.image_dataset_from_directory(
+    TRAIN_DIR, labels="inferred", label_mode="categorical",
+    class_names=CLASS_NAMES, color_mode="grayscale",
+    image_size=IMG_SIZE, batch_size=BATCH_SIZE, shuffle=False
+)
+_train_file_paths = [str(Path(p).resolve()) for p in train_feature_ds.file_paths]
+train_feature_ds = train_feature_ds.map(
+    lambda x, y: (normalization_layer(x), y),
+    num_parallel_calls=tf.data.AUTOTUNE
+).prefetch(tf.data.AUTOTUNE)
+
 # ================================================================
 # 18. EXTRACT TRAIN FEATURES
 # ================================================================
@@ -434,7 +427,7 @@ print("EXTRACTING TRAIN FEATURES")
 print("=" * 70)
 
 X_train_features, y_train = extract_features(
-    train_ds
+    train_feature_ds
 )
 
 print(
@@ -561,6 +554,12 @@ np.save(
     ),
     y_train
 )
+if len(_train_file_paths) != len(y_train):
+    raise ValueError(
+        f"Train path/label count mismatch: {len(_train_file_paths)} paths vs {len(y_train)} labels."
+    )
+with open(os.path.join(FEATURES_DIR, "train_sample_paths.json"), "w", encoding="utf-8") as _f:
+    json.dump(_train_file_paths, _f, indent=2)
 
 np.save(
     os.path.join(
@@ -594,7 +593,18 @@ np.save(
     y_test
 )
 
-print("✓ All 128-D feature files saved.")
+# Preserve the exact test-image order used by image_dataset_from_directory
+# so downstream prediction arrays can be audited against the same held-out samples.
+import json
+_test_paths = [str(Path(p).resolve()) for p in _test_file_paths]
+if len(_test_paths) != len(y_test):
+    raise ValueError(
+        f"Test path/label count mismatch: {len(_test_paths)} paths vs {len(y_test)} labels."
+    )
+with open(os.path.join(FEATURES_DIR, "test_sample_paths.json"), "w", encoding="utf-8") as _f:
+    json.dump(_test_paths, _f, indent=2)
+
+print("✓ All 128-D feature files saved, including the ordered test-image manifest.")
 
 
 # ================================================================
